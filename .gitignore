@@ -1,0 +1,19 @@
+# 機密與執行期資料（絕對不可進 git）
+certs/
+data/
+*.secret
+*.pem
+*.key
+*.jks
+*.keystore
+turn-audit*
+
+# 本機設定與建置產物
+local.properties
+.gradle/
+build/
+**/build/
+node_modules/
+.DS_Store
+*.log
+deploy.env

@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="客廳麥克風">
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<title>客廳麥克風</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; font-family:-apple-system,system-ui,sans-serif; background:#111; color:#fff; min-height:100vh; }
+  .wrap { padding:24px; text-align:center; }
+  h1 { font-size:22px; margin:8px 0 4px; }
+  .hint { font-size:15px; opacity:.8; line-height:1.6; }
+  input { font-size:30px; width:6em; text-align:center; letter-spacing:6px; padding:8px; border-radius:12px; border:1px solid #888; margin-top:12px; }
+  button { font-size:22px; min-height:56px; padding:14px 32px; border:0; border-radius:14px; background:#1f7a3a; color:#fff; width:80%; max-width:360px; margin-top:16px; }
+  button.danger { background:#ff3b30; }
+  button:disabled { opacity:.5; }
+  .meter { height:18px; width:80%; max-width:360px; margin:24px auto 0; background:#333; border-radius:9px; overflow:hidden; }
+  #level { height:100%; width:0%; background:#34c759; transition:width .1s linear; }
+  #msg { font-size:16px; margin-top:16px; min-height:24px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>客廳麥克風</h1>
+  <div class="hint">把這支手機放在客廳（靠近小孩或沙發），保持螢幕亮著、這個頁面不要關閉。<br>手機的聲音會送到電視，讓老婆聽得到客廳的聲音。</div>
+
+  <div id="codeBox">
+    <div class="hint" style="margin-top:20px">輸入電視上的配對碼</div>
+    <label for="code" style="display:block;font-size:16px;opacity:.8">配對碼</label>
+    <input id="code" inputmode="numeric" maxlength="6" placeholder="000000" enterkeyhint="go" autocomplete="one-time-code">
+  </div>
+
+  <button id="start">開始收音</button>
+  <button id="stop" class="danger hidden">停止</button>
+
+  <div class="meter"><div id="level"></div></div>
+  <div id="msg" role="status" aria-live="polite">準備中…</div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+const PAIR_KEY = 'pairCode';
+const MIC_DEVICE_KEY = 'micDeviceId';
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+const codeBox = document.getElementById('codeBox');
+const codeInput = document.getElementById('code');
+const msg = document.getElementById('msg');
+const levelEl = document.getElementById('level');
+
+let stream = null;
+let pc = null;
+let ice = { iceServers: [] };
+let meterTimer = null;
+let wakeLock = null;
+
+function setMsg(t, level) { msg.textContent = t; msg.className = level || ''; }
+function friendlyError(e) {
+  const n = e && e.name;
+  if (n === 'NotAllowedError' || n === 'SecurityError') return '需要允許麥克風，客廳的聲音才送得到電視。請到瀏覽器的網站設定允許麥克風後重新整理。';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return '找不到麥克風，請確認手機沒有被其他 App 占用。';
+  if (n === 'NotReadableError' || n === 'AbortError') return '麥克風被其他 App 占用，請先關閉其他 App 再試。';
+  return '發生問題，請重新整理後再試一次。';
+}
+
+function getMicDeviceId() {
+  try {
+    let id = localStorage.getItem(MIC_DEVICE_KEY);
+    if (!id) { id = crypto.randomUUID(); localStorage.setItem(MIC_DEVICE_KEY, id); }
+    return id;
+  } catch (e) { return crypto.randomUUID(); }
+}
+
+// 配對碼換房間（與視訊頁面共用同一組配對碼）
+async function resolveRoom() {
+  const direct = new URLSearchParams(location.search).get('room');
+  if (direct) return direct;
+  const code = codeInput.value.trim() || (localStorage.getItem(PAIR_KEY) || '');
+  if (!/^\d{6}$/.test(code)) throw new Error('請輸入 6 位數配對碼');
+  const r = await fetch('/join-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    try { localStorage.removeItem(PAIR_KEY); } catch (e) { /* ignore */ }
+    codeBox.classList.remove('hidden');
+    throw new Error(data.error || '配對失敗');
+  }
+  try { localStorage.setItem(PAIR_KEY, code); } catch (e) { /* ignore */ }
+  return data.roomId;
+}
+
+// 音量表：確認手機真的有收到聲音
+function startMeter(s, preCtx) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = preCtx || new Ctx();
+  ctx.resume().catch(() => {});
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  ctx.createMediaStreamSource(s).connect(analyser);
+  const buf = new Uint8Array(analyser.fftSize);
+  meterTimer = setInterval(() => {
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (const v of buf) { const x = (v - 128) / 128; sum += x * x; }
+    const rms = Math.sqrt(sum / buf.length);
+    levelEl.style.width = Math.min(100, rms * 300) + '%';
+  }, 100);
+  startMeter.ctx = ctx;
+}
+function stopMeter() {
+  if (meterTimer) clearInterval(meterTimer);
+  meterTimer = null;
+  levelEl.style.width = '0%';
+  if (startMeter.ctx) { startMeter.ctx.close().catch(() => {}); startMeter.ctx = null; }
+}
+
+async function keepAwake() {
+  try {
+    if (!('wakeLock' in navigator) || (wakeLock && !wakeLock.released)) return;
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });   // 系統釋放後清空，回前景時會重新要
+  } catch (e) { wakeLock = null; }
+}
+
+// 電視是 offer 端：這裡收到 offer 後，加上手機麥克風再回 answer
+async function onSignal(m) {
+  if (m.from !== 'tv') return;
+  if (m.type === 'offer' && stream) {
+    const desc = m.data && m.data.desc ? m.data.desc : m.data;
+    const restart = !!(m.data && m.data.restart);
+    if (!(restart && pc)) {
+      if (pc) pc.close();
+      pc = new RTCPeerConnection(ice);
+      stream.getAudioTracks().forEach((t) => pc.addTrack(t, stream));
+      pc.onicecandidate = (e) => { if (e.candidate) send('tv', 'ice', e.candidate, 'mic'); };
+      watchConnection(pc, {
+        onState: (s) => {
+          if (s === 'connected') setMsg('已連到電視，老婆可以聽到客廳的聲音', 'good');
+          else if (s === 'disconnected') setMsg('訊號不穩，嘗試恢復…');
+        },
+        onRecover: () => setMsg('等待電視重新連線…'),
+        onFail: () => { setMsg('連線失敗，3 秒後自動重新連線…'); setTimeout(() => { if (stream) send('tv', 'hello', { deviceId: getMicDeviceId(), label: '客廳麥克風' }, 'mic'); }, 3000); },
+      });
+    }
+    await pc.setRemoteDescription(desc);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send('tv', 'answer', pc.localDescription, 'mic');
+  } else if (m.type === 'ice' && pc && m.data) {
+    await pc.addIceCandidate(m.data).catch(() => {});
+  } else if (m.type === 'denied') {
+    setMsg('電視端暫時不允許這支手機。請找在家的人到電視上按「允許」，再按一次「開始收音」。', 'bad');
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    stopMeter();
+  }
+}
+
+startBtn.onclick = async () => {
+  // 手勢剛發生時就建立音訊環境，之後 await 不會讓手勢失效
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const gestureCtx = Ctx ? new Ctx() : null;
+  if (gestureCtx) gestureCtx.resume().catch(() => {});
+  startBtn.disabled = true;
+  setMsg('確認配對碼…');
+  let roomId;
+  try { roomId = await resolveRoom(); }
+  catch (e) { setMsg(e.message); startBtn.disabled = false; return; }
+
+  setMsg('開啟麥克風…');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true },
+    });
+  } catch (e) {
+    setMsg(friendlyError(e), 'bad');
+    startBtn.disabled = false;
+    return;
+  }
+  ice = await iceConfig();
+  startMeter(stream, gestureCtx);
+  keepAwake();
+  Signal.connect('mic', onSignal, roomId);
+  const once = () => { window.removeEventListener('signal-open', once); send('tv', 'hello', { deviceId: getMicDeviceId(), label: '客廳麥克風' }, 'mic'); };
+  window.addEventListener('signal-open', once);
+  codeBox.classList.add('hidden');
+  startBtn.classList.add('hidden');
+  stopBtn.classList.remove('hidden');
+  setMsg('等待電視確認…');
+};
+
+// S5：切到其他 App 或鎖定後，麥克風軌道可能已結束；回前景時要明確告知，不能假裝還在收音
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !stream) return;
+  keepAwake();
+  const dead = stream.getAudioTracks().some((t) => t.readyState === 'ended');
+  if (dead) setMsg('麥克風已中斷（可能因為切換了 App 或鎖定螢幕）。請按「停止」後再按「開始收音」。', 'bad');
+});
+stopBtn.onclick = () => {
+  Signal.close();
+  if (pc) { pc.close(); pc = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  stopMeter();
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  send('tv', 'bye', null, 'mic');
+  stopBtn.classList.add('hidden');
+  startBtn.classList.remove('hidden');
+  startBtn.disabled = false;
+  setMsg('已停止');
+};
+
+if (new URLSearchParams(location.search).get('room') || localStorage.getItem(PAIR_KEY)) {
+  codeBox.classList.add('hidden');
+  setMsg('按下開始收音');
+} else {
+  setMsg('請輸入電視上的配對碼');
+}
+</script>
+</body>
+</html>

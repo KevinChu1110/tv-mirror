@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TV Mirror · Mac</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1d1d1f; --bg:#f5f5f7; --accent:#0a84ff; --ok:#30d158; --bad:#ff453a; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#f5f5f7; --bg:#1c1c1e; } }
+  body { margin:0; font-family:-apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg);
+         min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  main { width:min(520px, 92vw); text-align:center; }
+  h1 { font-size:22px; margin:0 0 8px; }
+  #status { margin:12px 0 24px; font-size:15px; opacity:.85; }
+  button { font-size:17px; padding:12px 28px; border:0; border-radius:12px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align:middle; }
+  .dot.ok { background:var(--ok); }
+  ol { text-align:left; line-height:1.7; font-size:14px; opacity:.8; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TV Mirror（Mac 端）</h1>
+  <div id="status"><span class="dot" id="dot"></span><span id="text">尚未分享</span></div>
+  <button id="share">選擇畫面並開始分享</button>
+  <ol>
+    <li>電視先打開 <code>/tv</code> 頁面。</li>
+    <li>點上面按鈕，選要分享的視窗或整個螢幕。</li>
+    <li>要帶聲音請勾選「分享系統音訊」或選分頁，依 macOS 權限提示允許。</li>
+  </ol>
+</main>
+<script src="/common.js"></script>
+<script>
+const ROLE = 'mac';
+const btn = document.getElementById('share');
+const text = document.getElementById('text');
+const dot = document.getElementById('dot');
+let stream = null;
+let pc = null;
+
+function setStatus(msg, ok) {
+  text.textContent = msg;
+  dot.classList.toggle('ok', !!ok);
+}
+
+// 電視每次連上都會送 hello，Mac 就重新建立一條 PeerConnection 給它
+async function startPeer() {
+  if (!stream) return;
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: [] }); // 區網直連，不需要 STUN
+  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+  pc.onicecandidate = (e) => { if (e.candidate) send('tv', 'ice', e.candidate); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus('已連線，電視正在顯示畫面', true);
+    if (['failed', 'disconnected'].includes(pc.connectionState)) setStatus('連線中斷，等待電視重新連線');
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send('tv', 'offer', pc.localDescription);
+  setStatus('已送出連線請求，等待電視回應…');
+}
+
+Signal.connect(ROLE, async (msg) => {
+  if (msg.type === 'hello') return startPeer();
+  if (!pc) return;
+  if (msg.type === 'answer') await pc.setRemoteDescription(msg.data);
+  if (msg.type === 'ice' && msg.data) await pc.addIceCandidate(msg.data).catch(() => {});
+});
+
+btn.onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+  } catch (e) {
+    setStatus('未選擇畫面或權限被拒絕');
+    return;
+  }
+  stream.getVideoTracks()[0].addEventListener('ended', () => {
+    setStatus('已停止分享');
+    if (pc) pc.close();
+    stream = null;
+    btn.disabled = false;
+  });
+  btn.disabled = true;
+  setStatus('已選取畫面，等待電視連線…');
+  startPeer(); // 若電視已先連上，直接發起
+};
+</script>
+</body>
+</html>

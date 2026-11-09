@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>視訊 · 電視端</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; color:#fff; font-family:system-ui,sans-serif; overflow:hidden; }
+  #remote { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+  #local { position:fixed; right:32px; bottom:32px; width:320px; height:180px; object-fit:cover;
+           border-radius:14px; border:2px solid rgba(255,255,255,.4); background:#111; transform:scaleX(-1); }
+  #overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#111; }
+  #overlay.hidden, .hidden { display:none !important; }
+  .card { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:20; background:rgba(20,20,20,.95); padding:24px 40px; border-radius:20px; text-align:center; }
+  .box { text-align:center; max-width:1000px; padding:24px; }
+  .title { font-size:40px; font-weight:700; margin-bottom:18px; }
+  .hint { font-size:22px; opacity:.85; margin:8px 0; }
+  #code { font-size:120px; font-weight:700; letter-spacing:16px; margin:12px 0; font-variant-numeric:tabular-nums; }
+  .small { font-size:18px; opacity:.6; word-break:break-all; }
+  button { font-size:26px; padding:16px 36px; border:0; border-radius:16px; background:#0a84ff; color:#fff; margin:10px; }
+  button.secondary { background:#3a3a3c; }
+  button.danger { background:#ff453a; }
+  button:focus { outline:4px solid #fff; outline-offset:4px; }
+  #msg { position:fixed; left:32px; bottom:32px; font-size:20px; background:rgba(0,0,0,.55); padding:8px 16px; border-radius:10px; }
+  #msg.good { border-left:6px solid #34c759; } #msg.warn { border-left:6px solid #ffd60a; } #msg.bad { border-left:6px solid #ff453a; }
+  #stats { position:fixed; left:24px; top:20px; font-size:18px; background:rgba(0,0,0,.5); padding:6px 12px; border-radius:8px; display:none; }
+  #micFloat { position:fixed; right:24px; top:20px; font-size:20px; padding:8px 14px; z-index:5; background:rgba(0,0,0,.6); border:1px solid rgba(255,255,255,.4); border-radius:10px; }
+</style>
+</head>
+<body>
+<video id="remote" autoplay playsinline></video>
+<video id="local" autoplay playsinline muted></video>
+<div id="msg">等待連線…</div>
+<div id="stats"></div>
+<button id="micFloat">🎤 切換麥克風</button>
+
+<div id="overlay">
+  <div id="waitBox" class="box">
+    <div class="title">視訊待命中</div>
+    <div class="hint">用手機掃描右邊的 QR code，或開啟 <span id="hostHint"></span>/call-join 輸入下方數字</div>
+    <div style="display:flex;align-items:center;justify-content:center;gap:48px;margin-top:8px">
+      <div id="qr" style="background:#fff;padding:14px;border-radius:14px;width:260px;height:260px"></div>
+      <div><div class="hint">配對碼</div><div id="code"></div></div>
+    </div>
+    <div class="hint small" id="link"></div>
+    <button id="regen" class="secondary">換新配對碼（舊的會失效）</button>
+    <button id="micBtn" class="secondary">切換麥克風</button>
+  </div>
+
+</div>
+
+<div id="approveBox" class="card hidden">
+  <div class="title" id="who">有人想加入視訊</div>
+  <div class="hint" id="countdown">要讓這台裝置加入嗎？</div>
+  <button id="deny" class="secondary">拒絕（預設）</button>
+  <button id="allowOnce" class="secondary">只允許這次</button>
+  <button id="allowRemember">允許並記住這台裝置</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.js"></script>
+<script src="/common.js"></script>
+<script>
+const ROOM_KEY = 'tvRoomId';
+const APPROVED_KEY = 'approvedDevices';
+const CAM_WARM_MS = 60000;           // 掛斷後鏡頭保溫 60 秒，再加入不用重開
+const TV_SEND = { maxBitrate: 1200000, maxFramerate: 24 };
+
+const msg = document.getElementById('msg');
+const remote = document.getElementById('remote');
+const local = document.getElementById('local');
+const overlay = document.getElementById('overlay');
+const waitBox = document.getElementById('waitBox');
+const approveBox = document.getElementById('approveBox');
+const who = document.getElementById('who');
+const linkEl = document.getElementById('link');
+const codeEl = document.getElementById('code');
+const statsEl = document.getElementById('stats');
+const allowRemember = document.getElementById('allowRemember');
+const allowOnce = document.getElementById('allowOnce');
+const denyBtn = document.getElementById('deny');
+
+let localStream = null;
+let pc = null;
+let ice = { iceServers: [] };
+let pending = null;        // 等待確認的裝置 { deviceId, label, kind }
+let statsTimer = null;
+let warmTimer = null;
+let micName = '';
+let micSource = 'auto';    // auto：有客廳手機就用手機；phone；local
+let micPc = null;
+let micTrack = null;
+
+function setMsg(t, level) {
+  msg.textContent = t;
+  msg.className = level || '';
+}
+
+// ---- 固定房間 / 配對碼 / 白名單 ----
+function getRoomId() {
+  let id = store.get(ROOM_KEY);
+  if (!id) { id = crypto.randomUUID(); store.set(ROOM_KEY, id); }
+  return id;
+}
+function getPairCode() {
+  let c = store.get('tvPairCode');
+  if (!c || !/^\d{6}$/.test(c)) { c = String(100000 + Math.floor(Math.random() * 900000)); store.set('tvPairCode', c); }
+  return c;
+}
+function getApproved() { try { return JSON.parse(store.get(APPROVED_KEY) || '{}'); } catch (e) { return {}; } }
+function saveApproved(o) { store.set(APPROVED_KEY, JSON.stringify(o)); }
+
+document.getElementById('hostHint').textContent = location.host;
+const roomId = getRoomId();
+function registerCode(code) {
+  return fetch('/register-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, roomId }),
+  });
+}
+function showCode(code) {
+  codeEl.textContent = code;
+  linkEl.textContent = `或開啟：${location.origin}/call-join?code=${code}`;
+  renderQr(`${location.origin}/call-join?code=${code}`);
+}
+// QR 內容帶入配對碼，手機掃描後直接進入加入頁；CDN 載入失敗時只顯示文字
+function renderQr(text) {
+  const box = document.getElementById('qr');
+  if (typeof qrcode !== 'function') { box.textContent = '（QR 無法載入）'; box.style.color = '#000'; return; }
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  box.innerHTML = qr.createSvgTag(7, 0);
+  box.querySelector('svg').style.width = '232px';
+  box.querySelector('svg').style.height = '232px';
+}
+showCode(getPairCode());
+registerCode(getPairCode()).catch(() => {});
+
+function regenPairCode() {
+  const old = store.get('tvPairCode');
+  let c;
+  do { c = String(100000 + Math.floor(Math.random() * 900000)); } while (c === old);
+  store.set('tvPairCode', c);
+  showCode(c);
+  registerCode(c)
+    .then((r) => setMsg(r.ok ? '已換新配對碼' : '換碼失敗，請再試一次', r.ok ? 'good' : 'bad'))
+    .catch(() => setMsg('換碼失敗，請檢查網路', 'bad'));
+}
+document.getElementById('regen').onclick = regenPairCode;
+document.getElementById('micBtn').onclick = switchMic;
+document.getElementById('micFloat').onclick = switchMic;
+
+function showWait() {
+  overlay.classList.remove('hidden');
+  waitBox.classList.remove('hidden');
+  hideApprove();
+}
+// 核准卡片獨立於覆蓋層，通話中也能顯示；同一台裝置重複請求只更新，不重複堆疊
+// 核准卡片：預設焦點放在「拒絕」，避免遙控器誤按 OK 讓陌生人或不想接的人進來；30 秒無人處理自動拒絕
+const APPROVE_TIMEOUT_S = 30;
+let approveTimer = null;
+function showApprove(p) {
+  pending = p;
+  who.textContent = `${p.label} 想加入視訊`;
+  approveBox.classList.remove('hidden');
+  denyBtn.focus();
+  let left = APPROVE_TIMEOUT_S;
+  const tick = () => {
+    document.getElementById('countdown').textContent = `${left} 秒後自動拒絕`;
+    if (left <= 0) { denyBtn.click(); return; }
+    left -= 1;
+  };
+  clearInterval(approveTimer);
+  tick();
+  approveTimer = setInterval(tick, 1000);
+}
+function hideApprove() {
+  pending = null;
+  clearInterval(approveTimer); approveTimer = null;
+  approveBox.classList.add('hidden');
+}
+
+// ---- 統計 ----
+function startStats() {
+  stopStats();
+  // 統計數字預設隱藏（給技術人員看），畫面只顯示三段式狀態
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    try { statsEl.textContent = await statsSummary(pc); } catch (e) { /* ignore */ }
+  }, 2000);
+}
+function stopStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = null;
+  statsEl.style.display = 'none';
+}
+
+// ---- 鏡頭與麥克風 ----
+function phoneMicLive() { return !!micTrack && micTrack.readyState === 'live'; }
+function micLabel() {
+  if (micSource !== 'local' && phoneMicLive()) return '客廳手機麥克風';
+  return micName || '無';
+}
+const audioOpts = (id) => ({
+  deviceId: id ? { exact: id } : undefined,
+  echoCancellation: true,
+  noiseSuppression: false,   // 降噪會把小聲的人聲也一起壓掉
+  autoGainControl: true,
+});
+const videoOpts = (id) => ({
+  width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24 },
+  deviceId: id ? { exact: id } : undefined,
+});
+const USB_RE = /logitech|streamcam|usb/i;
+
+// 第一次：找 USB 鏡頭並把 deviceId 記住；之後直接用記住的 id，只開一次鏡頭
+async function resolveDeviceIds() {
+  let camId = store.get('tvCamId');
+  let micId = store.get('tvMicId');
+  if (camId) return { camId, micId };
+  let devs = await navigator.mediaDevices.enumerateDevices();
+  if (!devs.some((d) => d.kind === 'videoinput' && d.label)) {
+    // 還沒拿過權限、看不到名稱：只探一次
+    const probe = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    probe.getTracks().forEach((t) => t.stop());
+    devs = await navigator.mediaDevices.enumerateDevices();
+  }
+  const cam = devs.find((d) => d.kind === 'videoinput' && USB_RE.test(d.label)) || devs.find((d) => d.kind === 'videoinput');
+  const mic = devs.find((d) => d.kind === 'audioinput' && USB_RE.test(d.label));
+  if (cam) { camId = cam.deviceId; store.set('tvCamId', camId); }
+  if (!micId && mic) micId = mic.deviceId;
+  return { camId, micId };
+}
+
+// 原生麥克風橋接（tw.kevin.tvcall 的 NativeMic）：原生 AudioRecord 錄到的 PCM 轉成音軌
+let nativeGen = null, nativeWriter = null, nativeTs = 0;
+function nativeAudioTrack() {
+  if (!nativeGen) {
+    if (typeof MediaStreamTrackGenerator !== 'function') return null;
+    nativeGen = new MediaStreamTrackGenerator({ kind: 'audio' });
+    nativeWriter = nativeGen.writable.getWriter();
+    nativeTs = 0;
+  }
+  return nativeGen;
+}
+window.nativePcm = (b64, rate) => {
+  if (!nativeWriter) return;
+  const bin = atob(b64);
+  const n = bin.length >> 1;
+  const data = new Int16Array(n);
+  for (let i = 0; i < n; i++) data[i] = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+  // 峰值限制：超過約 75% 滿刻度就整段等比例縮小，避免大聲時爆音（削波）
+  let peak = 0;
+  for (let i = 0; i < n; i++) { const a = Math.abs(data[i]); if (a > peak) peak = a; }
+  const LIMIT = 24500;
+  if (peak > LIMIT) { const k = LIMIT / peak; for (let i = 0; i < n; i++) data[i] = Math.round(data[i] * k); }
+  const ad = new AudioData({ format: 's16', sampleRate: rate, numberOfFrames: n, numberOfChannels: 1, timestamp: nativeTs, data });
+  nativeTs += Math.round((n * 1e6) / rate);
+  nativeWriter.write(ad).catch(() => {});
+};
+function startNativeMic() {
+  if (typeof NativeMic === 'undefined') return false;
+  try { return !!NativeMic.start() && !!nativeAudioTrack(); } catch (e) { return false; }
+}
+
+// 麥克風軌道結束（系統停止收音）時，只重新開麥克風，不動鏡頭
+async function reacquireAudio() {
+  if (!localStream) return;
+  if (startNativeMic()) {
+    const nt = nativeAudioTrack();
+    localStream.getAudioTracks().forEach((t) => { localStream.removeTrack(t); if (t !== nt) t.stop(); });
+    if (!localStream.getAudioTracks().includes(nt)) localStream.addTrack(nt);
+    micName = 'USB 麥克風（原生）';
+    applyOutgoingAudio();
+    setMsg(`麥克風已接上 ｜ ${micLabel()}`, 'good');
+    return;
+  }
+  const { micId } = await resolveDeviceIds();
+  const raw = await navigator.mediaDevices.getUserMedia({ audio: audioOpts(micId) }).catch(() => navigator.mediaDevices.getUserMedia({ audio: audioOpts(null) }));
+  const nt = raw.getAudioTracks()[0];
+  localStream.getAudioTracks().forEach((t) => { localStream.removeTrack(t); t.stop(); });
+  localStream.addTrack(nt);
+  watchAudioTrack(nt);
+  micName = nt.label || micName;
+  applyOutgoingAudio();
+  setMsg(`麥克風已重新接上 ｜ ${micLabel()}`, 'good');
+}
+// 監看麥克風軌道：結束就自動重新開啟，並在畫面上明確告知
+function watchAudioTrack(t) {
+  t.onended = () => {
+    setMsg('麥克風中斷，正在重新接上…', 'warn');
+    setTimeout(() => { reacquireAudio().catch(() => setMsg('麥克風無法重新接上，請按「切換麥克風」', 'bad')); }, 500);
+  };
+}
+async function ensureMedia() {
+  clearTimeout(warmTimer); warmTimer = null;
+  if (localStream) {
+    const vLive = localStream.getVideoTracks().some((t) => t.readyState === 'live');
+    const aLive = localStream.getAudioTracks().some((t) => t.readyState === 'live');
+    if (vLive && aLive) return localStream;
+    if (vLive) { await reacquireAudio(); return localStream; }   // 鏡頭還在、麥克風壞了：只換麥克風
+    stopLocal();
+  }
+  const { camId, micId } = await resolveDeviceIds();
+  let raw;
+  if (startNativeMic()) {
+    // 麥克風走原生橋接（WebView 的麥克風拿不到資料），鏡頭仍用 WebView 取得
+    const v = await navigator.mediaDevices.getUserMedia({ video: videoOpts(camId) }).catch(async (e) => {
+      if (e.name !== 'OverconstrainedError' && e.name !== 'NotFoundError') throw e;
+      store.del('tvCamId');
+      return navigator.mediaDevices.getUserMedia({ video: videoOpts(null) });
+    });
+    raw = new MediaStream([...v.getVideoTracks(), nativeAudioTrack()]);
+    micName = 'USB 麥克風（原生）';
+  } else {
+    try {
+      raw = await navigator.mediaDevices.getUserMedia({ video: videoOpts(camId), audio: audioOpts(micId) });
+    } catch (e) {
+      if (e.name !== 'OverconstrainedError' && e.name !== 'NotFoundError') throw e;
+      // 記住的裝置已不存在（拔插過）：清掉再用預設
+      store.del('tvCamId'); store.del('tvMicId');
+      raw = await navigator.mediaDevices.getUserMedia({ video: videoOpts(null), audio: audioOpts(null) });
+    }
+    micName = raw.getAudioTracks()[0] ? raw.getAudioTracks()[0].label : '';
+    if (raw.getAudioTracks()[0]) watchAudioTrack(raw.getAudioTracks()[0]);
+  }
+  localStream = raw;
+  local.srcObject = localStream;
+  return localStream;
+}
+function stopLocal() {
+  if (typeof NativeMic !== 'undefined') { try { NativeMic.stop(); } catch (e) { /* ignore */ } }
+  if (localStream) { localStream.getTracks().forEach((t) => { if (t !== nativeGen) t.stop(); }); localStream = null; }
+  local.srcObject = null;
+}
+function scheduleWarmStop() {
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => { if (!pc) stopLocal(); }, CAM_WARM_MS);
+}
+
+async function listMics() {
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  return devs.filter((d) => d.kind === 'audioinput' && d.deviceId);
+}
+// 切換麥克風：不掛斷，直接替換通話中的音軌。選項含客廳手機（有連上時）與電視本機各麥克風
+async function switchMic() {
+  const locals = await listMics();
+  const options = [];
+  if (phoneMicLive()) options.push({ kind: 'phone' });
+  locals.forEach((d) => options.push({ kind: 'local', device: d }));
+  if (!options.length) { setMsg('找不到可用的麥克風', 'bad'); return; }
+  const savedId = store.get('tvMicId');
+  let cur = -1;
+  if (micSource === 'phone' || (micSource === 'auto' && phoneMicLive())) cur = options.findIndex((o) => o.kind === 'phone');
+  else cur = options.findIndex((o) => o.kind === 'local' && o.device.deviceId === savedId);
+  const next = options[(cur + 1) % options.length];
+  if (next.kind === 'phone') {
+    micSource = 'phone';
+    applyOutgoingAudio();
+    setMsg('已切換到：客廳手機麥克風', 'good');
+    return;
+  }
+  micSource = 'local';
+  store.set('tvMicId', next.device.deviceId);
+  setMsg('切換麥克風中…');
+  try {
+    const raw = await navigator.mediaDevices.getUserMedia({ audio: audioOpts(next.device.deviceId) });
+    micName = raw.getAudioTracks()[0] ? raw.getAudioTracks()[0].label : '';
+    const newTrack = raw.getAudioTracks()[0];
+    if (localStream) {
+      localStream.getAudioTracks().forEach((t) => { localStream.removeTrack(t); t.stop(); });
+      localStream.addTrack(newTrack);
+    }
+    applyOutgoingAudio();
+    setMsg(`已切換麥克風 ｜ ${micLabel()}`, 'good');
+  } catch (e) {
+    setMsg('切換失敗：' + e.name, 'bad');
+  }
+}
+
+// ---- 送給老婆的聲音：客廳手機優先，否則電視本機 ----
+function outgoingAudioTrack() {
+  if (micSource !== 'local' && phoneMicLive()) return micTrack;
+  return localStream ? localStream.getAudioTracks()[0] : null;
+}
+function applyOutgoingAudio() {
+  const t = outgoingAudioTrack();
+  if (!pc || !t) return;
+  const sender = pc.getSenders().find((x) => x.track && x.track.kind === 'audio');
+  if (sender) sender.replaceTrack(t).catch(() => {});
+}
+
+// ---- 與老婆手機的連線 ----
+function teardownCall(reason) {
+  if (pc) { pc.close(); pc = null; }
+  stopStats();
+  remote.srcObject = null;
+  showWait();
+  scheduleWarmStop();
+  if (reason) setMsg(reason, 'warn');
+}
+
+async function sendOffer(restart) {
+  if (!pc) return;
+  const offer = await pc.createOffer(restart ? { iceRestart: true } : undefined);
+  await pc.setLocalDescription(offer);
+  send('join', 'offer', { desc: pc.localDescription, restart: !!restart }, 'tv');
+}
+
+function makePeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection(ice);
+  localStream.getVideoTracks().forEach((t) => pc.addTrack(t, localStream));
+  const at = outgoingAudioTrack();
+  if (at) pc.addTrack(at, localStream);
+  preferH264(pc);
+  pc.ontrack = (e) => {
+    remote.srcObject = e.streams[0] || new MediaStream([e.track]);
+    remote.play().catch(() => {});
+    overlay.classList.add('hidden');
+    setMsg(`視訊中 ｜ 麥克風：${micLabel()}`, 'good');
+  };
+  pc.onicecandidate = (e) => { if (e.candidate) send('join', 'ice', e.candidate, 'tv'); };
+  watchConnection(pc, {
+    onState: (s) => {
+      if (s === 'connected') { limitVideoSender(pc, TV_SEND); setMsg(`${stateText(s)} ｜ 麥克風：${micLabel()}`, 'good'); }
+      else if (s === 'disconnected') setMsg(stateText(s), 'warn');
+      else if (s === 'connecting') setMsg(stateText(s));
+    },
+    onRecover: () => { setMsg('重新連線中…', 'warn'); sendOffer(true).catch(() => {}); },
+    onFail: () => teardownCall('連線失敗，等待對方重新加入…'),
+  });
+  startStats();
+  return pc;
+}
+
+async function startCall(p) {
+  setMsg(`${p.label} 加入中…`);
+  try {
+    await ensureMedia();
+  } catch (e) {
+    setMsg('無法使用鏡頭或麥克風：' + e.name, 'bad');
+    send('join', 'denied', null, 'tv');
+    showWait();
+    return;
+  }
+  ice = await iceConfig();          // 每次通話都重抓 TURN 憑證（1 小時會過期）
+  makePeer();
+  setMsg(`連線中 ｜ 麥克風：${micLabel()}`);
+  await sendOffer(false);
+}
+
+// ---- 客廳手機麥克風 ----
+async function startMicCall(p) {
+  setMsg(`${p.label} 連線中…`);
+  if (micPc) micPc.close();
+  ice = await iceConfig();
+  micPc = new RTCPeerConnection(ice);
+  micPc.addTransceiver('audio', { direction: 'recvonly' });
+  micPc.ontrack = (e) => {
+    micTrack = e.track;
+    applyOutgoingAudio();
+    setMsg(`客廳麥克風已接上（${p.label}）`, 'good');
+  };
+  micPc.onicecandidate = (e) => { if (e.candidate) send('mic', 'ice', e.candidate, 'tv'); };
+  watchConnection(micPc, {
+    onRecover: async () => {
+      if (!micPc) return;
+      const offer = await micPc.createOffer({ iceRestart: true });
+      await micPc.setLocalDescription(offer);
+      send('mic', 'offer', { desc: micPc.localDescription, restart: true }, 'tv');
+    },
+    onFail: () => stopMic(),
+  });
+  const offer = await micPc.createOffer();
+  await micPc.setLocalDescription(offer);
+  send('mic', 'offer', { desc: micPc.localDescription, restart: false }, 'tv');
+}
+function stopMic() {
+  if (micPc) { micPc.close(); micPc = null; }
+  micTrack = null;
+  applyOutgoingAudio();
+  setMsg('客廳麥克風已離開，改用電視麥克風', 'warn');
+}
+
+// ---- 加入請求與核准 ----
+async function onHello(data, kind) {
+  const deviceId = data && data.deviceId;
+  const label = (data && data.label) || '未知裝置';
+  if (!deviceId) return;
+  const approved = getApproved();
+  if (approved[deviceId]) kind === 'mic' ? startMicCall({ deviceId, label }) : startCall({ deviceId, label });
+  else showApprove({ deviceId, label, kind });
+}
+allowRemember.onclick = () => {
+  if (!pending) return;
+  const approved = getApproved();
+  approved[pending.deviceId] = pending.label;
+  saveApproved(approved);
+  const p = pending; hideApprove();
+  p.kind === 'mic' ? startMicCall(p) : startCall(p);
+};
+allowOnce.onclick = () => {
+  if (!pending) return;
+  const p = pending; hideApprove();
+  p.kind === 'mic' ? startMicCall(p) : startCall(p);
+};
+denyBtn.onclick = () => {
+  const target = pending && pending.kind === 'mic' ? 'mic' : 'join';
+  hideApprove();
+  send(target, 'denied', null, 'tv');
+  showWait();
+  setMsg('已拒絕');
+};
+
+// 遙控器返回鍵（由 App 呼叫）：掛斷所有連線
+window.tvHangup = function () {
+  send('join', 'bye', null, 'tv');
+  send('mic', 'bye', null, 'tv');
+  if (micPc) { micPc.close(); micPc = null; micTrack = null; }
+  if (pc) { pc.close(); pc = null; }
+  stopStats();
+  stopLocal();
+  remote.srcObject = null;
+  showWait();
+  setMsg('已掛斷');
+};
+
+Signal.connect('tv', async (m) => {
+  if (m.from === 'mic') {
+    if (m.type === 'hello') await onHello(m.data, 'mic');
+    else if (m.type === 'answer' && micPc) await micPc.setRemoteDescription(m.data);
+    else if (m.type === 'ice' && micPc && m.data) await micPc.addIceCandidate(m.data).catch(() => {});
+    else if (m.type === 'bye') stopMic();
+    return;
+  }
+  if (m.type === 'hello') {
+    // 手機重新加入＝舊連線已失效：先清掉舊的 pc，避免畫面與狀態停在「連線良好」
+    if (pc) { pc.close(); pc = null; stopStats(); remote.srcObject = null; }
+    await onHello(m.data, 'join');
+  }
+  else if (m.type === 'answer' && pc) await pc.setRemoteDescription(m.data);
+  else if (m.type === 'ice' && pc && m.data) await pc.addIceCandidate(m.data).catch(() => {});
+  else if (m.type === 'bye') { hideApprove(); teardownCall('對方已掛斷，等待下次加入'); }
+}, roomId);
+
+iceConfig().then((c) => { ice = c; });
+setMsg('等待老婆加入…');
+</script>
+</body>
+</html>

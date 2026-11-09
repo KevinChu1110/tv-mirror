@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'tw.kevin.tvcall'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'tw.kevin.tvcall'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    // 正式簽章：金鑰放在 ~/.gradle/gradle.properties（不進 git）：
+    //   tvcallStoreFile=/路徑/release.jks  tvcallStorePassword=…  tvcallKeyAlias=…  tvcallKeyPassword=…
+    // 沒有設定時，release 退回 debug 金鑰（只供自己測試）。
+    signingConfigs {
+        release {
+            if (project.hasProperty('tvcallStoreFile')) {
+                storeFile file(project.property('tvcallStoreFile'))
+                storePassword project.property('tvcallStorePassword')
+                keyAlias project.property('tvcallKeyAlias')
+                keyPassword project.property('tvcallKeyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig project.hasProperty('tvcallStoreFile') ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

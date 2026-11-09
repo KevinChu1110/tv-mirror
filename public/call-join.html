@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="視訊">
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<title>視訊通話</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; font-family:-apple-system,system-ui,sans-serif; background:#000; color:#fff; }
+  #remote { width:100vw; height:42dvh; object-fit:cover; background:#111; display:block; }
+  #local { position:fixed; right:12px; top:12px; width:110px; height:150px; object-fit:cover;
+           border-radius:12px; border:2px solid rgba(255,255,255,.5); background:#222; transform:scaleX(-1); }
+  #panel { padding:16px; text-align:center; padding-bottom:max(16px, env(safe-area-inset-bottom)); }
+  input { font-size:36px; width:7em; text-align:center; letter-spacing:8px; padding:10px; border-radius:12px; border:1px solid #888; }
+  button { font-size:20px; padding:14px 32px; border:0; border-radius:14px; background:#34c759; color:#fff; width:80%; max-width:360px; margin-top:12px; }
+  button:disabled { opacity:.5; }
+  button.danger { background:#ff3b30; margin-top:16px; }
+  .hidden { display:none !important; }
+  #msg { font-size:16px; opacity:.9; margin-top:12px; min-height:22px; }
+  #msg.good { color:#34c759; } #msg.warn { color:#ffd60a; } #msg.bad { color:#ff453a; }
+  button { min-height:52px; }
+  button { background:#1f7a3a; }
+  #join, #hangup { background:#1f7a3a; }
+  #bar { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin-top:12px; }
+  #bar button { width:auto; min-width:120px; margin-top:0; font-size:20px; background:#3a3a3c; padding:12px 18px; }
+  #bar button.on { background:#8a5a00; }
+  #bar #hangup { background:#ff3b30; margin-left:24px; }
+  #changeName { background:none; color:#0a84ff; font-size:16px; min-height:44px; margin-top:8px; width:auto; }
+  #help { text-align:left; background:#1c1c1e; border-radius:14px; padding:16px; margin:14px auto; max-width:360px; font-size:16px; line-height:1.7; }
+  #nameBox input { font-size:24px; letter-spacing:0; width:12em; }
+  #changeName { color:#4da3ff; }
+  #tapSound { position:fixed; left:0; right:0; top:0; height:70vh; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.6); z-index:9; }
+  #tapSound div { font-size:28px; font-weight:700; padding:24px 40px; border-radius:20px; background:#0a84ff; }
+</style>
+</head>
+<body>
+<video id="remote" autoplay playsinline></video>
+<video id="local" autoplay playsinline muted></video>
+<div id="tapSound" class="hidden" role="button" tabindex="0" aria-label="點一下開始聽聲音"><div>🔊 點一下開始聽</div></div>
+<div id="panel">
+  <div id="nameBox">
+    <div style="font-size:16px;opacity:.8;margin-bottom:6px">你的名字（電視會顯示，只要輸入一次）</div>
+    <label for="name" style="display:block;font-size:16px;opacity:.8">你的名字</label>
+    <input id="name" maxlength="10" placeholder="例如：媽媽" autocomplete="off" enterkeyhint="next">
+  </div>
+  <div id="codeBox">
+    <div style="font-size:16px;opacity:.8;margin-bottom:6px">輸入電視上的 6 位數配對碼（只要輸入一次）</div>
+    <label for="code" style="display:block;font-size:16px;opacity:.8">配對碼</label>
+    <input id="code" inputmode="numeric" maxlength="6" placeholder="000000" enterkeyhint="go" autocomplete="one-time-code">
+  </div>
+  <div id="msg" role="status" aria-live="polite">準備中…</div>
+  <button id="join">加入視訊</button>
+  <button id="changeName" class="hidden">改名字</button>
+  <div id="bar" class="hidden">
+    <button id="muteBtn" aria-pressed="false">🎤 靜音</button>
+    <button id="camBtn" aria-pressed="false">📷 關閉鏡頭</button>
+    <button id="hangup" class="danger">📞 掛斷</button>
+  </div>
+  <div id="help" class="hidden" role="status" aria-live="polite"></div>
+</div>
+<script src="/common.js"></script>
+<script>
+const DEVICE_KEY = 'deviceId';
+const PAIR_KEY = 'pairCode';
+const PHONE_SEND = { maxBitrate: 800000, maxFramerate: 24 };
+const remote = document.getElementById('remote');
+const local = document.getElementById('local');
+const msg = document.getElementById('msg');
+const joinBtn = document.getElementById('join');
+const hangupBtn = document.getElementById('hangup');
+const codeBox = document.getElementById('codeBox');
+const codeInput = document.getElementById('code');
+const tapSound = document.getElementById('tapSound');
+
+let localStream = null;
+let pc = null;
+let ice = { iceServers: [] };
+let roomId = null;
+let wantCall = false;      // 使用者想要在通話中（斷線時用來決定要不要自動重連）
+let rejoinTimer = null;
+let wakeLock = null;
+
+function setMsg(t, level) { msg.textContent = t; msg.className = level || ''; }
+
+function getDeviceId() {
+  let id = store.get(DEVICE_KEY);
+  if (!id) { id = crypto.randomUUID(); store.set(DEVICE_KEY, id); }
+  return id;
+}
+function deviceLabel(id) {
+  const ua = navigator.userAgent;
+  const kind = /iPhone|iPad/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android 手機' : '裝置';
+  const name = (store.get('displayName') || '').trim();
+  return name ? `${name}（${kind}）` : `${kind}（${id.slice(-4)}）`;
+}
+// 權限被拒時給出分平台的步驟，而不是只顯示「再試一次」
+// M7：把瀏覽器的錯誤名稱換成家人看得懂的中文與下一步
+function friendlyError(e) {
+  const n = e && e.name;
+  if (n === 'NotAllowedError' || n === 'SecurityError') return '需要允許相機與麥克風，對方才看得到你。';
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return '找不到鏡頭或麥克風，請確認手機沒有被其他 App 占用。';
+  if (n === 'NotReadableError' || n === 'AbortError') return '鏡頭或麥克風被其他 App 占用，請先關閉其他 App 再試。';
+  if (n === 'TypeError') return '這個瀏覽器無法使用視訊，請改用 Safari 或 Chrome 開啟。';
+  return '發生問題，請重新整理後再試一次。';
+}
+function showPermissionHelp(err) {
+  const help = document.getElementById('help');
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad/.test(ua);
+  let text;
+  if (err && (err.name === 'NotFoundError' || err.name === 'OverconstrainedError')) {
+    text = '找不到鏡頭或麥克風，請確認手機沒有被其他 App 占用，然後重新整理。';
+  } else if (ios) {
+    text = '需要允許相機與麥克風，對方才看得到你。\n設定 → Safari → 相機 → 允許\n設定 → Safari → 麥克風 → 允許\n然後回到這裡重新整理。';
+  } else {
+    text = '需要允許相機與麥克風，對方才看得到你。\n點網址列左邊的鎖頭 → 權限 → 相機與麥克風 → 允許\n然後重新整理。';
+  }
+  help.innerText = text;
+  help.classList.remove('hidden');
+}
+// 靜音／關鏡頭的選擇用變數保存；按鈕文字永遠跟著變數走，套用到目前的 track（若有）
+let micMuted = false, camOff = false;
+function applyTrackStates() {
+  if (localStream) {
+    localStream.getAudioTracks().forEach((t) => { t.enabled = !micMuted; });
+    localStream.getVideoTracks().forEach((t) => { t.enabled = !camOff; });
+  }
+  const mb = document.getElementById('muteBtn');
+  mb.textContent = micMuted ? '🔇 已靜音' : '🎤 靜音';
+  mb.classList.toggle('on', micMuted);
+  mb.setAttribute('aria-pressed', String(micMuted));
+  const cb = document.getElementById('camBtn');
+  cb.textContent = camOff ? '📷 已關閉鏡頭' : '📷 關閉鏡頭';
+  cb.classList.toggle('on', camOff);
+  cb.setAttribute('aria-pressed', String(camOff));
+}
+function setMuted(on) { micMuted = on; applyTrackStates(); }
+function setCameraOff(off) { camOff = off; applyTrackStates(); }
+document.getElementById('muteBtn').onclick = () => setMuted(!micMuted);
+document.getElementById('camBtn').onclick = () => setCameraOff(!camOff);
+document.getElementById('changeName').onclick = () => {
+  document.getElementById('nameBox').classList.remove('hidden');
+  document.getElementById('name').focus();
+};
+
+// 配對碼換成房間：手機記住配對碼，之後不用再輸入
+async function resolveRoom() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('room')) return q.get('room');
+  const code = codeInput.value.trim() || q.get('code') || store.get(PAIR_KEY) || '';
+  if (!/^\d{6}$/.test(code)) throw new Error('請輸入 6 位數配對碼');
+  let r;
+  try {
+    r = await fetch('/join-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+  } catch (e) {
+    throw new Error('網路不通，請確認 Wi-Fi 或行動網路後再試。');
+  }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    store.del(PAIR_KEY);
+    codeBox.classList.remove('hidden');
+    throw new Error(data.error || '配對失敗');
+  }
+  store.set(PAIR_KEY, code);
+  return data.roomId;
+}
+
+async function keepAwake() {
+  try { if ('wakeLock' in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* ignore */ }
+}
+function releaseWake() {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+
+async function getCamera() {
+  return navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24 } },
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+}
+
+function playRemote() {
+  if (!remote.srcObject) return;           // 沒有串流時不做任何事
+  remote.muted = false;
+  remote.volume = 1;
+  remote.play().then(() => {
+    tapSound.classList.add('hidden');
+  }).catch((e) => {
+    // 只有被自動播放政策擋下才顯示「點一下」；其他中斷（AbortError）不算
+    if (e && e.name === 'NotAllowedError') tapSound.classList.remove('hidden');
+  });
+}
+tapSound.onclick = playRemote;
+tapSound.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); playRemote(); } });
+remote.onclick = () => { if (remote.paused) playRemote(); };
+
+// 老婆手機是 answer 端：收到電視的 offer 才建立 PeerConnection
+function makePeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection(ice);
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.ontrack = (e) => {
+    const stream = e.streams[0] || new MediaStream([e.track]);
+    if (remote.srcObject !== stream) remote.srcObject = stream;   // 同一串流只設定一次
+    playRemote();
+  };
+  pc.onicecandidate = (e) => { if (e.candidate) send('tv', 'ice', e.candidate, 'join'); };
+  watchConnection(pc, {
+    onState: (s) => {
+      if (s === 'connected') { limitVideoSender(pc, PHONE_SEND); setMsg(stateText(s), 'good'); }
+      else if (s === 'disconnected') setMsg(stateText(s), 'warn');
+      else if (s === 'connecting') setMsg(stateText(s));
+    },
+    // 電視是 offer 端，由它做 ICE 重啟；這裡只等
+    onRecover: () => setMsg('等待電視重新連線…', 'warn'),
+    onFail: () => scheduleRejoin('連線失敗，3 秒後自動重新加入…'),
+  });
+  return pc;
+}
+
+// 信令依序處理，避免 offer 與 restart 交錯時 pc 被替換到一半
+let sigChain = Promise.resolve();
+function enqueue(fn) { sigChain = sigChain.then(fn); return sigChain; }
+let pendingIce = [];
+async function addIce(c) {
+  if (!pc || !pc.remoteDescription) { pendingIce.push(c); return; }
+  await pc.addIceCandidate(c).catch(() => {});
+}
+async function handleOffer(data) {
+  const desc = data && data.desc ? data.desc : data;
+  const restart = !!(data && data.restart);
+  if (!localStream || !wantCall) return;   // 已掛斷或已被拒絕，不接受新的 offer
+  if (!(restart && pc)) makePeer();
+  await pc.setRemoteDescription(desc);
+  const buffered = pendingIce; pendingIce = [];
+  for (const c of buffered) await addIce(c);
+  preferH264(pc);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  send('tv', 'answer', pc.localDescription, 'join');
+}
+
+function onSignal(m) {
+  if (m.type === 'offer') enqueue(() => handleOffer(m.data)).catch(() => setMsg('連線設定失敗，請重新整理後再試。', 'bad'));
+  else if (m.type === 'ice' && m.data) enqueue(() => addIce(m.data));
+  else if (m.type === 'denied') { wantCall = false; endCall('電視端暫時不允許這台裝置加入。請找在家的人到電視上按「允許」，再重新加入。'); }
+  else if (m.type === 'bye') { wantCall = false; endCall('電視已掛斷'); }
+}
+
+function sayHello() {
+  const id = getDeviceId();
+  send('tv', 'hello', { deviceId: id, label: deviceLabel(id) }, 'join');
+}
+let rejoinAttempts = 0;
+const MAX_REJOIN = 5;
+function scheduleRejoin(text) {
+  if (!wantCall) return;
+  if (rejoinTimer) return;            // 已經排了一次重新加入，不要重複排
+  if (rejoinAttempts >= MAX_REJOIN) {
+    wantCall = false;
+    endCall('連續幾次都連不上。請重新整理頁面，或找在家的人看一下電視。');
+    return;
+  }
+  const wait = 3000 * Math.pow(2, rejoinAttempts);   // 3、6、12、24、48 秒
+  rejoinAttempts += 1;
+  setMsg(text, 'warn');
+  rejoinTimer = setTimeout(() => {
+    rejoinTimer = null;
+    if (!wantCall) return;
+    if (pc) { pc.close(); pc = null; }
+    remote.srcObject = null;
+    setMsg('重新加入中…（第 ' + rejoinAttempts + ' 次）');
+    sayHello();
+  }, wait);
+}
+// M14：信令連線真的開啟後才送 hello，避免電視的回應在連線前就遺失
+function helloWhenOpen() {
+  const once = () => { window.removeEventListener('signal-open', once); sayHello(); };
+  window.addEventListener('signal-open', once);
+}
+window.addEventListener('signal-send-failed', () => {
+  if (wantCall) setMsg('網路不通，正在重試…', 'warn');
+});
+window.addEventListener('signal-lost', () => {
+  if (wantCall && !pc) setMsg('網路連線中斷，正在重新連線…', 'warn');
+});
+
+function resetButtons() {
+  document.getElementById('bar').classList.add('hidden');
+  joinBtn.classList.remove('hidden');
+  joinBtn.disabled = false;
+}
+
+joinBtn.onclick = async () => {
+  const nameInput = document.getElementById('name');
+  const typed = nameInput.value.trim();
+  if (typed) store.set('displayName', typed);
+  if (!store.get('displayName')) { setMsg('請先輸入你的名字', 'bad'); nameInput.focus(); return; }
+  document.getElementById('help').classList.add('hidden');
+  joinBtn.disabled = true;
+  setMsg('確認配對碼…');
+  try {
+    roomId = await resolveRoom();
+  } catch (e) {
+    setMsg(e.message, 'bad');
+    joinBtn.disabled = false;
+    return;
+  }
+  setMsg('準備鏡頭與麥克風…');
+  try {
+    localStream = await getCamera();
+  } catch (e) {
+    setMsg(friendlyError(e), 'bad');
+    showPermissionHelp(e);
+    joinBtn.disabled = false;
+    return;
+  }
+  local.srcObject = localStream;
+  applyTrackStates();
+  // 在使用者點擊的這一刻先「啟用」播放元件，之後有聲音的自動播放比較不會被擋
+  remote.play().catch(() => {});
+  keepAwake();
+  ice = await iceConfig();
+  rejoinAttempts = 0;
+  Signal.connect('join', onSignal, roomId);
+  codeBox.classList.add('hidden');
+  document.getElementById('nameBox').classList.add('hidden');
+  joinBtn.classList.add('hidden');
+  document.getElementById('bar').classList.remove('hidden');
+  wantCall = true;
+  setMsg('已送出加入請求。請到電視上按「允許」，家人才看得到你。');
+  helloWhenOpen();
+  clearTimeout(waitHintTimer);
+  waitHintTimer = setTimeout(() => {
+    if (wantCall && !pc) setMsg('還在等電視確認。如果很久都沒有反應，請找在家的人看一下電視。', 'warn');
+  }, 30000);
+};
+let waitHintTimer = null;
+
+function endCall(text) {
+  clearTimeout(rejoinTimer); rejoinTimer = null;
+  clearTimeout(waitHintTimer);
+  pendingIce = [];
+  Signal.close();
+  if (pc) { pc.close(); pc = null; }
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  local.srcObject = null;
+  remote.srcObject = null;
+  tapSound.classList.add('hidden');
+  releaseWake();
+  document.getElementById('bar').classList.add('hidden');
+  joinBtn.textContent = '重新加入視訊';
+  document.getElementById('changeName').classList.remove('hidden');
+  resetButtons();
+  setMsg(text);
+}
+hangupBtn.onclick = () => {
+  wantCall = false;
+  send('tv', 'bye', null, 'join');
+  endCall('已掛斷');
+};
+
+// 回到前景：iOS 切到別的 App 後鏡頭會停，回來自動重新取得並換回去
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible' || !wantCall || !localStream) return;
+  keepAwake();
+  const dead = localStream.getTracks().some((t) => t.readyState === 'ended');
+  if (!dead) { if (remote.paused) playRemote(); return; }
+  try {
+    const fresh = await getCamera();
+    localStream.getTracks().forEach((t) => t.stop());
+    localStream = fresh;
+    local.srcObject = fresh;
+    if (pc) {
+      for (const s of pc.getSenders()) {
+        const nt = fresh.getTracks().find((t) => s.track && t.kind === s.track.kind);
+        if (nt) await s.replaceTrack(nt).catch(() => {});
+      }
+    }
+    setMsg('已恢復鏡頭', 'good');
+  } catch (e) {
+    setMsg('回到前景後無法重新開啟鏡頭：' + e.name, 'bad');
+  }
+});
+
+// M9：非 https 時拿不到鏡頭，直接說清楚
+if (!window.isSecureContext) {
+  setMsg('這個網址不是安全連線（https），無法使用鏡頭。請用 https 網址開啟這個頁面。', 'bad');
+  joinBtn.disabled = true;
+}
+// 已記住配對碼、或從連結／QR 進來：不用再輸入
+const q0 = new URLSearchParams(location.search);
+// 名字只問一次：已經記住就不再顯示輸入框
+if (store.get('displayName')) {
+  document.getElementById('nameBox').classList.add('hidden');
+  document.getElementById('changeName').classList.remove('hidden');
+}
+if (q0.get('room') || q0.get('code') || store.get(PAIR_KEY)) {
+  if (q0.get('code')) codeInput.value = q0.get('code');
+  codeBox.classList.add('hidden');
+  setMsg('按下按鈕開啟鏡頭與麥克風');
+} else {
+  setMsg('請輸入電視上的配對碼');
+}
+</script>
+</body>
+</html>

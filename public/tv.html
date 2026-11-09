@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TV Mirror · TV</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; color:#fff; font-family:system-ui,sans-serif; overflow:hidden; }
+  video { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; background:#111; }
+  #overlay.hidden { display:none; }
+  button { font-size:24px; padding:14px 36px; border:0; border-radius:14px; background:#0a84ff; color:#fff; }
+  #msg { font-size:20px; opacity:.85; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline></video>
+<div id="overlay">
+  <div id="msg">等待 Mac 分享畫面…</div>
+  <button id="start">按此開始接收（含聲音）</button>
+</div>
+<script src="/common.js"></script>
+<script>
+const ROLE = 'tv';
+const video = document.getElementById('v');
+const overlay = document.getElementById('overlay');
+const msg = document.getElementById('msg');
+const startBtn = document.getElementById('start');
+let pc = null;
+
+// 電視瀏覽器通常需要使用者互動後才能有聲音，所以第一次要按一下確認
+startBtn.onclick = () => {
+  overlay.classList.add('hidden');
+  video.muted = false;
+  video.play().catch(() => {});
+};
+
+function resetPeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: [] });
+  pc.ontrack = (e) => {
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    video.play().catch(() => {});
+    msg.textContent = '已接收畫面';
+  };
+  pc.onicecandidate = (e) => { if (e.candidate) send('mac', 'ice', e.candidate); };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      video.srcObject = null;
+      overlay.classList.remove('hidden');
+      msg.textContent = '連線中斷，等待 Mac 重新分享…';
+    }
+  };
+}
+
+Signal.connect(ROLE, async (msg) => {
+  if (msg.type === 'offer') {
+    resetPeer();
+    await pc.setRemoteDescription(msg.data);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send('mac', 'answer', pc.localDescription);
+  } else if (msg.type === 'ice' && pc && msg.data) {
+    await pc.addIceCandidate(msg.data).catch(() => {});
+  }
+});
+
+// 告訴 Mac：電視已就緒（Mac 若已在分享，會回送 offer）
+window.addEventListener('load', () => send('mac', 'hello', null));
+</script>
+</body>
+</html>
